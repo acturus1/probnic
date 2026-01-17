@@ -21,9 +21,30 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from aiogram.exceptions import TelegramBadRequest
+import logger
+
+
 # Загрузка переменных окружения
 load_dotenv()
 
+# Проверка переменных окружения для Render
+
+# Если запускаем на Render, проверяем переменные
+if 'RENDER' in os.environ:
+    logger.info("🚀 Запуск на Render.com")
+
+    # Проверяем обязательные переменные
+    required_vars = ['BOT_TOKEN']
+    missing_vars = []
+
+    for var in required_vars:
+        if not os.getenv(var):
+            missing_vars.append(var)
+
+    if missing_vars:
+        logger.error(f"❌ Отсутствуют переменные окружения: {missing_vars}")
+        logger.error("Добавьте их в настройках Render Dashboard")
+        sys.exit(1)
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,

@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: casino-telegram-bot
+    env: python
+    region: frankfurt  # Или singapore, oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+    autoDeploy: true

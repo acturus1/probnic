@@ -1,4 +1,3 @@
-aiogram==3.0.0b7
-aiohttp==3.9.0
+aiogram==3.24.0
 python-dotenv==1.0.0
-sqlite3
+aiofiles==25.1.0
