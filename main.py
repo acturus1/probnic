@@ -21,30 +21,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from aiogram.exceptions import TelegramBadRequest
-import logger
-
 
 # Загрузка переменных окружения
 load_dotenv()
 
-# Проверка переменных окружения для Render
-
-# Если запускаем на Render, проверяем переменные
-if 'RENDER' in os.environ:
-    logger.info("🚀 Запуск на Render.com")
-
-    # Проверяем обязательные переменные
-    required_vars = ['BOT_TOKEN']
-    missing_vars = []
-
-    for var in required_vars:
-        if not os.getenv(var):
-            missing_vars.append(var)
-
-    if missing_vars:
-        logger.error(f"❌ Отсутствуют переменные окружения: {missing_vars}")
-        logger.error("Добавьте их в настройках Render Dashboard")
-        sys.exit(1)
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -193,7 +173,18 @@ class Database:
                 )
             ''')
 
-            logger.info("✅ База данных инициализирована")
+            self.execute_with_retry('''
+                CREATE TABLE IF NOT EXISTS auto_spin_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    stop_win REAL DEFAULT 0,
+                    stop_loss REAL DEFAULT 0,
+                    min_balance REAL DEFAULT 0,
+                    speed_mode TEXT DEFAULT 'normal',
+                    display_mode TEXT DEFAULT 'full',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
 
         except Exception as e:
             logger.error(f"Error initializing database: {e}")
@@ -355,6 +346,110 @@ class Database:
             )
         except Exception as e:
             logger.error(f"Error in log_admin_action: {e}")
+
+    def get_auto_settings(self, user_id: int):
+        """Получить настройки авто-спинов пользователя"""
+        try:
+            cursor = self.execute_with_retry(
+                'SELECT * FROM auto_spin_settings WHERE user_id = ?',
+                (user_id,)
+            )
+            settings = cursor.fetchone()
+
+            if not settings:
+                # Создаем настройки по умолчанию
+                default_settings = {
+                    'user_id': user_id,
+                    'stop_win': 0,
+                    'stop_loss': 0,
+                    'min_balance': 0,
+                    'speed_mode': 'normal',
+                    'display_mode': 'full',
+                    'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                self.save_auto_settings(user_id, default_settings)
+                return default_settings
+
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, settings))
+
+        except Exception as e:
+            logger.error(f"Error in get_auto_settings: {e}")
+            return {
+                'stop_win': 0,
+                'stop_loss': 0,
+                'min_balance': 0,
+                'speed_mode': 'normal',
+                'display_mode': 'full'
+            }
+
+    def save_auto_settings(self, user_id: int, settings: dict):
+        """Сохранить настройки авто-спинов"""
+        try:
+            # Проверяем существующие настройки
+            cursor = self.execute_with_retry(
+                'SELECT 1 FROM auto_spin_settings WHERE user_id = ?',
+                (user_id,)
+            )
+
+            stop_win = settings.get('stop_win', 0)
+            stop_loss = settings.get('stop_loss', 0)
+            min_balance = settings.get('min_balance', 0)
+            speed_mode = settings.get('speed_mode', 'normal')
+            display_mode = settings.get('display_mode', 'full')
+
+            if cursor.fetchone():
+                # Обновляем существующие
+                query = '''
+                    UPDATE auto_spin_settings 
+                    SET stop_win = ?, stop_loss = ?, min_balance = ?,
+                        speed_mode = ?, display_mode = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                '''
+                values = (stop_win, stop_loss, min_balance,
+                          speed_mode, display_mode, user_id)
+            else:
+                # Создаем новые
+                query = '''
+                    INSERT INTO auto_spin_settings 
+                    (user_id, stop_win, stop_loss, min_balance, speed_mode, display_mode)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                '''
+                values = (user_id, stop_win, stop_loss,
+                          min_balance, speed_mode, display_mode)
+
+            self.execute_with_retry(query, values)
+
+        except Exception as e:
+            logger.error(f"Error in save_auto_settings: {e}")
+
+    def update_auto_setting(self, user_id: int, setting_name: str, value):
+        """Обновить одну настройку"""
+        try:
+            # Получаем текущие настройки
+            current = self.get_auto_settings(user_id)
+            current[setting_name] = value
+
+            # Сохраняем обновленные
+            self.save_auto_settings(user_id, current)
+
+        except Exception as e:
+            logger.error(f"Error in update_auto_setting: {e}")
+
+    def reset_auto_settings(self, user_id: int):
+        """Сбросить настройки авто-спинов к значениям по умолчанию"""
+        try:
+            default_settings = {
+                'stop_win': 0,
+                'stop_loss': 0,
+                'min_balance': 0,
+                'speed_mode': 'normal',
+                'display_mode': 'full'
+            }
+            self.save_auto_settings(user_id, default_settings)
+
+        except Exception as e:
+            logger.error(f"Error in reset_auto_settings: {e}")
 
 
 db = Database()
@@ -631,8 +726,6 @@ async def spin_slot(message: Message):
         except:
             pass
 
-# АВТО-СПИНЫ
-
 
 @dp.message(F.text == "⚡ Авто-спины")
 @dp.message(Command("auto"))
@@ -665,143 +758,39 @@ async def auto_spin_menu(message: Message):
         parse_mode="Markdown",
         reply_markup=auto_spin_keyboard()
     )
-# ДОБАВЬТЕ В ИМПОРТЫ
-
-# ОБНОВЛЕННЫЙ ОБРАБОТЧИК АВТО-СПИНОВ
 
 
 @dp.callback_query(F.data.startswith("auto_"))
-async def auto_spin_handler(callback: CallbackQuery, state: FSMContext):
+async def auto_spin_handler(callback: CallbackQuery):
     user = db.get_user(callback.from_user.id)
     action = callback.data
 
     logger.info(f"Auto-spin action received: {action}")
 
-    # Обработка основных команд
-    if action == "auto_back":
+    # Если это подтверждение запуска - обрабатываем здесь же
+    if action.startswith("auto_confirm_"):
         try:
-            await callback.message.delete()
-        except:
-            pass
-        await callback.answer("Возвращаемся в меню")
-        return
-
-    if action == "auto_back_to_main":
-        try:
-            await callback.message.delete()
-        except:
-            pass
-        await callback.message.answer(
-            "Возвращаемся в главное меню...",
-            reply_markup=main_keyboard()
-        )
-        await callback.answer("Главное меню")
-        return
-
-    if action == "auto_settings":
-        settings_text = """
-⚙️ *НАСТРОЙКИ АВТО-СПИНОВ*
-
-Введите настройки в формате:
-`стоп_выигрыш стоп_убыток мин_баланс`
-Пример: `1000 500 100`
-
-Для отмены отправьте /cancel
-"""
-        try:
-            await callback.message.edit_text(settings_text, parse_mode="Markdown")
-        except:
-            await callback.message.answer(settings_text, parse_mode="Markdown")
-        await state.set_state(UserStates.auto_spin_settings)
-        await callback.answer()
-        return
-
-    # Определяем количество спинов
-    spin_mapping = {
-        "auto_10": 10,
-        "auto_25": 25,
-        "auto_50": 50,
-        "auto_100": 100
-    }
-
-    # Проверяем, есть ли такое действие
-    if action not in spin_mapping:
-        await callback.answer("❌ Неизвестная команда")
-        logger.error(f"Unknown auto-spin action: {action}")
-        return
-
-    num_spins = spin_mapping[action]
-    bet_amount = user.get('current_bet', MIN_BET)
-    total_cost = bet_amount * num_spins
-
-    # Проверка баланса
-    if user['balance'] < total_cost:
-        await callback.answer(f"❌ Недостаточно средств! Нужно: {total_cost:.2f} ₽")
-        return
-
-    # Создаем клавиатуру подтверждения
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text=f"✅ Да, запустить {num_spins} спинов",
-                callback_data=f"confirm_auto_{num_spins}"  # Изменили префикс!
-            )
-        ],
-        [
-            InlineKeyboardButton(text="❌ Нет, отмена",
-                                 callback_data="auto_back")
-        ]
-    ])
-
-    confirm_text = f"""
-⚡ *ПОДТВЕРЖДЕНИЕ АВТО-СПИНОВ*
-
-Количество спинов: `{num_spins}`
-Ставка за спин: `{bet_amount:.2f} ₽`
-Общая стоимость: `{total_cost:.2f} ₽`
-Ваш баланс: `{user['balance']:.2f} ₽`
-
-*Будет выполнено {num_spins} автоматических спинов подряд.*
-
-Подтвердить запуск?
-"""
-
-    try:
-        await callback.message.edit_text(
-            confirm_text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-    except Exception as e:
-        await callback.message.answer(
-            confirm_text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
-    await callback.answer()
-
-# НОВЫЙ ОБРАБОТЧИК ДЛЯ ПОДТВЕРЖДЕНИЯ
-
-
-@dp.callback_query(F.data.startswith("confirm_auto_"))
-async def confirm_auto_spin(callback: CallbackQuery):
-    try:
-        # Извлекаем количество спинов
-        parts = callback.data.split("_")
-        if len(parts) != 3:
+            num_spins = int(action.split("_")[2])
+        except (IndexError, ValueError):
             await callback.answer("❌ Ошибка в данных")
+            logger.error(f"Error parsing auto_confirm data: {action}")
             return
 
-        num_spins = int(parts[2])
-        user = db.get_user(callback.from_user.id)
+        # КОД ДЛЯ ВЫПОЛНЕНИЯ АВТО-СПИНОВ
         user_id = user['user_id']
+        settings = db.get_auto_settings(user_id)
         bet_amount = user.get('current_bet', MIN_BET)
         total_cost = bet_amount * num_spins
 
+        # Проверка минимального баланса из настроек
+        min_balance = settings.get('min_balance', 0)
+        if min_balance > 0 and user['balance'] - total_cost < min_balance:
+            await callback.answer(f"❌ Нельзя опускать баланс ниже {min_balance} ₽")
+            return
+
         # Двойная проверка баланса
         if user['balance'] < total_cost:
-            await callback.answer(f"❌ Недостаточно средств!")
+            await callback.answer(f"❌ Недостаточно средств! Нужно {total_cost:.2f} ₽, а у вас {user['balance']:.2f} ₽")
             return
 
         # Снимаем деньги
@@ -812,13 +801,16 @@ async def confirm_auto_spin(callback: CallbackQuery):
         try:
             progress_msg = await callback.message.edit_text(
                 f"⚡ *ЗАПУСК {num_spins} СПИНОВ*\n\n"
-                f"⏳ Подготовка... 0/{num_spins}",
+                f"⏳ Подготовка... 0/{num_spins}\n"
+                f"💰 Ставка: {bet_amount:.2f} ₽",
                 parse_mode="Markdown"
             )
-        except:
+        except Exception as e:
+            logger.error(f"Error editing message: {e}")
             progress_msg = await callback.message.answer(
                 f"⚡ *ЗАПУСК {num_spins} СПИНОВ*\n\n"
-                f"⏳ Подготовка... 0/{num_spins}",
+                f"⏳ Подготовка... 0/{num_spins}\n"
+                f"💰 Ставка: {bet_amount:.2f} ₽",
                 parse_mode="Markdown"
             )
 
@@ -827,6 +819,16 @@ async def confirm_auto_spin(callback: CallbackQuery):
         wins = 0
         losses = 0
         biggest_win = 0
+        start_balance = user['balance']
+
+        # Получаем скорость из настроек
+        speed_settings = {
+            'normal': 0.3,
+            'fast': 0.1,
+            'turbo': 0.05
+        }
+        speed = speed_settings.get(settings.get('speed_mode', 'normal'), 0.1)
+        display_mode = settings.get('display_mode', 'full')
 
         for i in range(1, num_spins + 1):
             try:
@@ -853,26 +855,51 @@ async def confirm_auto_spin(callback: CallbackQuery):
                     result["is_win"]
                 )
 
-                # Обновляем прогресс каждые 10 спинов
-                if i % 10 == 0 or i == num_spins:
+                # Проверяем условия остановки
+                stop_win = settings.get('stop_win', 0)
+                stop_loss = settings.get('stop_loss', 0)
+
+                current_profit = total_win - (bet_amount * i)
+                if stop_win > 0 and current_profit >= stop_win:
+                    # Достигли стоп-прибыли
+                    await callback.answer(f"✅ Достигнута стоп-прибыль: {stop_win} ₽")
+                    num_spins = i  # Обновляем количество выполненных спинов
+                    break
+
+                if stop_loss > 0 and abs(current_profit) >= stop_loss:
+                    # Достигли стоп-убытка
+                    await callback.answer(f"⚠️ Достигнут стоп-убыток: {stop_loss} ₽")
+                    num_spins = i  # Обновляем количество выполненных спинов
+                    break
+
+                # Обновляем прогресс в зависимости от режима отображения
+                if display_mode == 'full' or (display_mode == 'summary' and i % 10 == 0) or i == num_spins:
                     win_rate = (wins / i) * 100 if i > 0 else 0
+                    current_profit = total_win - (bet_amount * i)
 
                     try:
-                        await progress_msg.edit_text(
-                            f"⚡ *ВЫПОЛНЕНИЕ АВТО-СПИНОВ*\n\n"
-                            f"⏳ Прогресс: {i}/{num_spins}\n"
-                            f"✅ Побед: {wins}\n"
-                            f"❌ Поражений: {losses}\n"
-                            f"📊 Винрейт: {win_rate:.1f}%\n"
-                            f"💰 Выигрыш: {total_win:.2f} ₽\n"
-                            f"🏦 Баланс: {new_balance:.2f} ₽",
-                            parse_mode="Markdown"
-                        )
-                    except:
-                        pass
+                        progress_text = f"""
+⚡ *ВЫПОЛНЕНИЕ АВТО-СПИНОВ*
 
-                # Небольшая пауза
-                await asyncio.sleep(0.05)
+⏳ Прогресс: {i}/{num_spins}
+✅ Побед: {wins}
+❌ Поражений: {losses}
+📊 Винрейт: {win_rate:.1f}%
+
+💰 Текущий выигрыш: {total_win:.2f} ₽
+💸 Текущая прибыль: {current_profit:.2f} ₽
+🏦 Баланс: {new_balance:.2f} ₽
+"""
+
+                        if i == num_spins:
+                            progress_text += f"\n✅ *Завершено!*"
+
+                        await progress_msg.edit_text(progress_text, parse_mode="Markdown")
+                    except Exception as e:
+                        logger.error(f"Error updating progress: {e}")
+
+                # Пауза в зависимости от скорости
+                await asyncio.sleep(speed)
 
             except Exception as e:
                 logger.error(f"Ошибка в спин #{i}: {e}")
@@ -883,8 +910,8 @@ async def confirm_auto_spin(callback: CallbackQuery):
 
         # Финальная статистика
         win_rate = (wins / num_spins) * 100 if num_spins > 0 else 0
-        profit = total_win - total_cost
-        start_balance = user['balance']
+        total_cost_final = bet_amount * num_spins
+        profit = total_win - total_cost_final
 
         # Формируем результат
         result_text = f"""
@@ -893,7 +920,7 @@ async def confirm_auto_spin(callback: CallbackQuery):
 *Общая статистика:*
 Выполнено спинов: `{num_spins}`
 Ставка за спин: `{bet_amount:.2f} ₽`
-Общая стоимость: `{total_cost:.2f} ₽`
+Общая стоимость: `{total_cost_final:.2f} ₽`
 
 *Результаты:*
 ✅ Побед: `{wins}`
@@ -941,7 +968,8 @@ async def confirm_auto_spin(callback: CallbackQuery):
                 parse_mode="Markdown",
                 reply_markup=result_keyboard
             )
-        except:
+        except Exception as e:
+            logger.error(f"Error editing final message: {e}")
             await progress_msg.answer(
                 result_text,
                 parse_mode="Markdown",
@@ -949,50 +977,527 @@ async def confirm_auto_spin(callback: CallbackQuery):
             )
 
         await callback.answer("✅ Авто-спины завершены!")
+        return  # Важно: return после обработки подтверждения
 
+    # Обработка основных команд
+    if action == "auto_back":
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        await callback.answer("Возвращаемся в меню")
+        return
+
+    if action == "auto_back_to_main":
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        await callback.message.answer(
+            "Возвращаемся в главное меню...",
+            reply_markup=main_keyboard()
+        )
+        await callback.answer("Главное меню")
+        return
+
+    if action == "auto_settings":
+        user_id = callback.from_user.id
+        settings = db.get_auto_settings(user_id)
+
+        # Текстовые обозначения
+        speed_texts = {
+            'normal': '🚶 Обычная',
+            'fast': '🏃 Быстрая',
+            'turbo': '⚡ Турбо'
+        }
+
+        display_texts = {
+            'full': '📊 Подробный',
+            'summary': '📈 Сводный',
+            'result': '🎯 Только итог'
+        }
+
+        settings_text = f"""
+⚙️ *НАСТРОЙКИ АВТО-СПИНОВ*
+
+*Условия остановки:*
+💰 Стоп-прибыль: `{settings.get('stop_win', 0)} ₽`
+💸 Стоп-убыток: `{settings.get('stop_loss', 0)} ₽`
+🏦 Мин. баланс: `{settings.get('min_balance', 0)} ₽`
+
+*Режимы:*
+⚡ Скорость: {speed_texts.get(settings.get('speed_mode', 'normal'))}
+📊 Отображение: {display_texts.get(settings.get('display_mode', 'full'))}
+
+Выберите что настроить:
+"""
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💰 Стоп-прибыль",
+                                     callback_data="set_stop_win"),
+                InlineKeyboardButton(text="💸 Стоп-убыток",
+                                     callback_data="set_stop_loss")
+            ],
+            [
+                InlineKeyboardButton(text="🏦 Мин. баланс",
+                                     callback_data="set_min_balance")
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⚡ Скорость", callback_data="set_speed"),
+                InlineKeyboardButton(text="📊 Отображение",
+                                     callback_data="set_display")
+            ],
+            [
+                InlineKeyboardButton(text="🎯 Быстрые пресеты",
+                                     callback_data="quick_presets")
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ Готово", callback_data="auto_back"),
+                InlineKeyboardButton(
+                    text="🔄 Сбросить", callback_data="reset_auto_settings")
+            ]
+        ])
+
+        await callback.message.edit_text(settings_text, parse_mode="Markdown", reply_markup=keyboard)
+        await callback.answer()
+        return
+
+    # Определяем количество спинов (только для auto_10, auto_25, auto_50, auto_100)
+    spin_mapping = {
+        "auto_10": 10,
+        "auto_25": 25,
+        "auto_50": 50,
+        "auto_100": 100
+    }
+
+    # Проверяем, есть ли такое действие
+    if action not in spin_mapping:
+        await callback.answer("❌ Неизвестная команда")
+        logger.error(f"Unknown auto-spin action: {action}")
+        return
+
+    num_spins = spin_mapping[action]
+    bet_amount = user.get('current_bet', MIN_BET)
+    total_cost = bet_amount * num_spins
+
+    # Проверка баланса
+    if user['balance'] < total_cost:
+        await callback.answer(f"❌ Недостаточно средств! Нужно: {total_cost:.2f} ₽")
+        return
+
+    # Создаем клавиатуру подтверждения
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"✅ Да, запустить {num_spins} спинов",
+                callback_data=f"auto_confirm_{num_spins}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="❌ Нет, отмена",
+                                 callback_data="auto_back")
+        ]
+    ])
+
+    confirm_text = f"""
+⚡ *ПОДТВЕРЖДЕНИЕ АВТО-СПИНОВ*
+
+Количество спинов: `{num_spins}`
+Ставка за спин: `{bet_amount:.2f} ₽`
+Общая стоимость: `{total_cost:.2f} ₽`
+Ваш баланс: `{user['balance']:.2f} ₽`
+
+*Будет выполнено {num_spins} автоматических спинов подряд.*
+
+Подтвердить запуск?
+"""
+
+    try:
+        await callback.message.edit_text(
+            confirm_text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
     except Exception as e:
-        logger.error(f"Ошибка в confirm_auto_spin: {e}")
-        await callback.answer("❌ Произошла ошибка")
+        await callback.message.answer(
+            confirm_text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
 
-
-@dp.callback_query(F.data == "auto_back_to_main")
-async def auto_back_to_main(callback: CallbackQuery):
-    await callback.message.delete()
-    await callback.message.answer(
-        "Возвращаемся в главное меню...",
-        reply_markup=main_keyboard()
-    )
     await callback.answer()
 
 
-@dp.message(UserStates.auto_spin_settings)
-async def process_auto_settings(message: Message, state: FSMContext):
-    if message.text == "/cancel":
-        await state.clear()
-        await message.answer("Настройки отменены")
-        return
+@dp.callback_query(F.data == "set_stop_win")
+async def set_stop_win_menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    current = db.get_auto_settings(user_id).get('stop_win', 0)
 
-    # Парсим настройки
+    text = f"""
+💰 *НАСТРОЙКА СТОП-ПРИБЫЛИ*
+
+Текущее: `{current} ₽`
+
+*Что это:*
+Авто-спины остановятся при достижении этой прибыли.
+
+Выберите значение:
+"""
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="100 ₽", callback_data="stopwin_100"),
+            InlineKeyboardButton(text="500 ₽", callback_data="stopwin_500")
+        ],
+        [
+            InlineKeyboardButton(text="1000 ₽", callback_data="stopwin_1000"),
+            InlineKeyboardButton(text="5000 ₽", callback_data="stopwin_5000")
+        ],
+        [
+            InlineKeyboardButton(text="❌ Отключить", callback_data="stopwin_0")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="auto_settings")
+        ]
+    ])
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stopwin_"))
+async def set_stop_win_value(callback: CallbackQuery):
+    value_str = callback.data.split("_")[1]
+
     try:
-        parts = message.text.split()
-        if len(parts) == 3:
-            stop_win = float(parts[0])
-            stop_loss = float(parts[1])
-            min_balance = float(parts[2])
+        value = float(value_str)
+        db.update_auto_setting(callback.from_user.id, 'stop_win', value)
 
-            await message.answer(
-                f"✅ Настройки сохранены:\n\n"
-                f"• Стоп при выигрыше > {stop_win} ₽\n"
-                f"• Стоп при убытке > {stop_loss} ₽\n"
-                f"• Минимальный баланс: {min_balance} ₽\n\n"
-                f"Эти настройки будут применены при следующих авто-спинах."
-            )
+        if value == 0:
+            msg = "✅ Стоп-прибыль отключена"
         else:
-            await message.answer("❌ Неверный формат. Используйте: число число число")
-    except ValueError:
-        await message.answer("❌ Ошибка: введите три числа через пробел")
+            msg = f"✅ Установлена: {value} ₽"
 
-    await state.clear()
+        await callback.answer(msg)
+        # Возвращаемся в меню настроек
+        await auto_spin_handler(callback)
+    except Exception as e:
+        logger.error(f"Error setting stop_win: {e}")
+        await callback.answer("❌ Ошибка")
+
+
+@dp.callback_query(F.data == "set_stop_loss")
+async def set_stop_loss_menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    current = db.get_auto_settings(user_id).get('stop_loss', 0)
+
+    text = f"""
+💸 *НАСТРОЙКА СТОП-УБЫТКА*
+
+Текущее: `{current} ₽`
+
+*Что это:*
+Авто-спины остановятся при достижении этого убытка.
+
+Выберите значение:
+"""
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="100 ₽", callback_data="stoploss_100"),
+            InlineKeyboardButton(text="300 ₽", callback_data="stoploss_300")
+        ],
+        [
+            InlineKeyboardButton(text="500 ₽", callback_data="stoploss_500"),
+            InlineKeyboardButton(text="1000 ₽", callback_data="stoploss_1000")
+        ],
+        [
+            InlineKeyboardButton(text="❌ Отключить",
+                                 callback_data="stoploss_0")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="auto_settings")
+        ]
+    ])
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stoploss_"))
+async def set_stop_loss_value(callback: CallbackQuery):
+    value_str = callback.data.split("_")[1]
+
+    try:
+        value = float(value_str)
+        db.update_auto_setting(callback.from_user.id, 'stop_loss', value)
+
+        if value == 0:
+            msg = "✅ Стоп-убыток отключен"
+        else:
+            msg = f"✅ Установлен: {value} ₽"
+
+        await callback.answer(msg)
+        # Возвращаемся в меню настроек
+        await auto_spin_handler(callback)
+    except Exception as e:
+        logger.error(f"Error setting stop_loss: {e}")
+        await callback.answer("❌ Ошибка")
+
+
+@dp.callback_query(F.data == "set_min_balance")
+async def set_min_balance_menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    current = db.get_auto_settings(user_id).get('min_balance', 0)
+
+    text = f"""
+🏦 *НАСТРОЙКА МИНИМАЛЬНОГО БАЛАНСА*
+
+Текущее: `{current} ₽`
+
+*Что это:*
+Авто-спины остановятся если баланс упадет ниже этой суммы.
+
+Выберите значение:
+"""
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="50 ₽", callback_data="minbal_50"),
+            InlineKeyboardButton(text="100 ₽", callback_data="minbal_100")
+        ],
+        [
+            InlineKeyboardButton(text="200 ₽", callback_data="minbal_200"),
+            InlineKeyboardButton(text="500 ₽", callback_data="minbal_500")
+        ],
+        [
+            InlineKeyboardButton(text="❌ Отключить", callback_data="minbal_0")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="auto_settings")
+        ]
+    ])
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("minbal_"))
+async def set_min_balance_value(callback: CallbackQuery):
+    value_str = callback.data.split("_")[1]
+
+    try:
+        value = float(value_str)
+        db.update_auto_setting(callback.from_user.id, 'min_balance', value)
+
+        if value == 0:
+            msg = "✅ Минимальный баланс отключен"
+        else:
+            msg = f"✅ Установлен: {value} ₽"
+
+        await callback.answer(msg)
+        # Возвращаемся в меню настроек
+        await auto_spin_handler(callback)
+    except Exception as e:
+        logger.error(f"Error setting min_balance: {e}")
+        await callback.answer("❌ Ошибка")
+
+
+@dp.callback_query(F.data == "set_speed")
+async def set_speed_menu(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🚶 Обычная", callback_data="speed_normal"),
+            InlineKeyboardButton(text="🏃 Быстрая", callback_data="speed_fast")
+        ],
+        [
+            InlineKeyboardButton(text="⚡ Турбо", callback_data="speed_turbo")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="auto_settings")
+        ]
+    ])
+
+    text = """
+⚡ *НАСТРОЙКА СКОРОСТИ*
+
+*🚶 Обычная* - Полная анимация (0.3с/спин)
+*🏃 Быстрая* - Ускоренная (0.1с/спин)
+*⚡ Турбо* - Максимальная скорость (0.05с/спин)
+
+Выберите режим:
+"""
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("speed_"))
+async def set_speed_value(callback: CallbackQuery):
+    speed = callback.data[6:]  # speed_normal → normal
+    db.update_auto_setting(callback.from_user.id, 'speed_mode', speed)
+
+    speed_names = {
+        'normal': '🚶 Обычная',
+        'fast': '🏃 Быстрая',
+        'turbo': '⚡ Турбо'
+    }
+
+    await callback.answer(f"✅ Скорость: {speed_names.get(speed, speed)}")
+    # Возвращаемся в меню настроек
+    await auto_spin_handler(callback)
+
+
+@dp.callback_query(F.data == "set_display")
+async def set_display_menu(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Подробный",
+                                 callback_data="display_full"),
+            InlineKeyboardButton(
+                text="📈 Сводный", callback_data="display_summary")
+        ],
+        [
+            InlineKeyboardButton(text="🎯 Только итог",
+                                 callback_data="display_result")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="auto_settings")
+        ]
+    ])
+
+    text = """
+📊 *НАСТРОЙКА ОТОБРАЖЕНИЯ*
+
+*📊 Подробный* - Показывать каждый спин
+*📈 Сводный* - Обновлять каждые 10 спинов
+*🎯 Только итог* - Показать только финальный результат
+
+Выберите режим:
+"""
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("display_"))
+async def set_display_value(callback: CallbackQuery):
+    display = callback.data[8:]  # display_full → full
+    db.update_auto_setting(callback.from_user.id, 'display_mode', display)
+
+    display_names = {
+        'full': '📊 Подробный',
+        'summary': '📈 Сводный',
+        'result': '🎯 Только итог'
+    }
+
+    await callback.answer(f"✅ Отображение: {display_names.get(display, display)}")
+    # Возвращаемся в меню настроек
+    await auto_spin_handler(callback)
+
+
+@dp.callback_query(F.data == "quick_presets")
+async def quick_presets_menu(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎯 Безопасный",
+                                 callback_data="preset_safe"),
+            InlineKeyboardButton(text="⚡ Агрессивный",
+                                 callback_data="preset_aggressive")
+        ],
+        [
+            InlineKeyboardButton(text="🚀 Максимальный",
+                                 callback_data="preset_max"),
+            InlineKeyboardButton(text="❌ Отключить все",
+                                 callback_data="preset_off")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="auto_settings")
+        ]
+    ])
+
+    text = """
+🎯 *БЫСТРЫЕ ПРЕСЕТЫ*
+
+*🎯 Безопасный* - 500/200/100 (стопы активированы)
+*⚡ Агрессивный* - 1000/500/50 (риск выше)
+*🚀 Максимальный* - 5000/1000/10 (для опытных)
+*❌ Отключить все* - 0/0/0 (без ограничений)
+
+Выберите пресет:
+"""
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("preset_"))
+async def apply_preset(callback: CallbackQuery):
+    preset = callback.data[7:]  # preset_safe → safe
+
+    presets = {
+        'safe': {'stop_win': 500, 'stop_loss': 200, 'min_balance': 100},
+        'aggressive': {'stop_win': 1000, 'stop_loss': 500, 'min_balance': 50},
+        'max': {'stop_win': 5000, 'stop_loss': 1000, 'min_balance': 10},
+        'off': {'stop_win': 0, 'stop_loss': 0, 'min_balance': 0}
+    }
+
+    if preset in presets:
+        settings = presets[preset]
+        db.save_auto_settings(callback.from_user.id, settings)
+
+        preset_names = {
+            'safe': '🎯 Безопасный',
+            'aggressive': '⚡ Агрессивный',
+            'max': '🚀 Максимальный',
+            'off': '❌ Все отключено'
+        }
+
+        await callback.answer(f"✅ Применен пресет: {preset_names[preset]}")
+        # Возвращаемся в меню настроек
+        await auto_spin_handler(callback)
+    else:
+        await callback.answer("❌ Неизвестный пресет")
+
+
+@dp.callback_query(F.data == "reset_auto_settings")
+async def reset_auto_settings_handler(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, сбросить",
+                                 callback_data="confirm_reset"),
+            InlineKeyboardButton(text="❌ Нет, отмена",
+                                 callback_data="auto_settings")
+        ]
+    ])
+
+    text = """
+🔄 *СБРОС НАСТРОЕК*
+
+Вы уверены что хотите сбросить все настройки авто-спинов?
+
+*Будут установлены значения по умолчанию:*
+💰 Стоп-прибыль: 0 ₽
+💸 Стоп-убыток: 0 ₽
+🏦 Мин. баланс: 0 ₽
+⚡ Скорость: Обычная
+📊 Отображение: Подробный
+"""
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "confirm_reset")
+async def confirm_reset_settings(callback: CallbackQuery):
+    db.reset_auto_settings(callback.from_user.id)
+    await callback.answer("✅ Настройки сброшены к значениям по умолчанию")
+    # Возвращаемся в меню настроек
+    await auto_spin_handler(callback)
 
 
 @dp.message(F.text == "💰 Мой баланс")
@@ -1445,8 +1950,6 @@ async def admin_callback_handler(callback: CallbackQuery):
             reply_markup=main_keyboard()
         )
         await callback.answer("Главное меню")
-
-# Админ команды через сообщения
 
 
 @dp.message(F.text.regexp(r'^\d+\s+\d+'))
